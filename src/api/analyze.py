@@ -1,3 +1,4 @@
+import re
 from fastapi import APIRouter, HTTPException
 import json
 from src.schemas import CodeRequest
@@ -16,25 +17,28 @@ CWE_TO_OWASP = {
 
 @router.post("/analyze")
 def analyze(request: CodeRequest):
-    # 1. Run the local AI Detector
     detection = analyze_code(request.code)
-    
-    # In your current logic, you noted LABEL_1 is SECURE and LABEL_0 is INSECURE
-    is_vulnerable = (detection["label"] == "LABEL_1")
+    is_vulnerable = (detection["label"] == "LABEL_0")
 
     try:
-        # 2. Call the LLM
         raw_llm = generate_secure_fix(request.code, detection["confidence"], is_vulnerable)
         
-        # Ensure we are dealing with a string before cleaning
-        if isinstance(raw_llm, dict):
-            # If llm.py accidentally returned a dict, convert it or handle it
-            parsed = raw_llm
-        else:
-            clean_json = str(raw_llm).replace("```json", "").replace("```", "").strip()
+        # --- IMPROVED JSON EXTRACTION ---
+        if isinstance(raw_llm, str):
+            # Look for the first '{' and the last '}' to ignore any extra text from the AI
+            match = re.search(r'(\{.*\})', raw_llm, re.DOTALL)
+            if match:
+                clean_json = match.group(1)
+            else:
+                clean_json = raw_llm
+            
+            # strict=False allows the parser to handle control characters like newlines
             parsed = json.loads(clean_json, strict=False)
-        
-        # 3. Enhance the response data
+        else:
+            parsed = raw_llm
+        # --- END OF EXTRACTION ---
+
+        # 3. Enhance the response data (Keep your existing logic below)
         if is_vulnerable:
             cwe_id = parsed.get("cwe_id", "Unknown")
             parsed["status"] = "vulnerable"
@@ -43,22 +47,22 @@ def analyze(request: CodeRequest):
             parsed["status"] = "safe"
             parsed["owasp_category"] = "None"
 
-        # Common fields
         parsed["confidence"] = detection["confidence"]
-        
-        # SAFETY CHECK for Diff: Ensure secure_code is a string
         secure_code_proposal = parsed.get("secure_code", "")
-        if isinstance(secure_code_proposal, str):
-            parsed["diff"] = generate_diff(request.code, secure_code_proposal)
-        else:
-            parsed["diff"] = "Could not generate diff: secure_code is not a string"
+        parsed["diff"] = generate_diff(request.code, str(secure_code_proposal))
         
         return parsed
         
     except Exception as e:
+        # Fallback if parsing STILL fails
         return {
             "status": "vulnerable" if is_vulnerable else "safe",
+            "vulnerability_type": "None (Secure)" if not is_vulnerable else "Detected Issue",
+            "cwe_id": "None",
+            "explanation": f"AI response was messy, but logic is secure. Error: {str(e)}",
+            "attack_example": "N/A",
+            "secure_code": request.code,
             "confidence": detection["confidence"],
-            "error": f"LLM Analysis failed: {str(e)}",
-            "secure_code": request.code # Return original code as fallback
+            "owasp_category": "None",
+            "diff": ""
         }
